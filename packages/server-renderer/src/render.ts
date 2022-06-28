@@ -2,9 +2,9 @@ import {
   Comment,
   Component,
   ComponentInternalInstance,
-  ComponentOptions,
   DirectiveBinding,
   Fragment,
+  FunctionalComponent,
   mergeProps,
   ssrUtils,
   Static,
@@ -87,13 +87,18 @@ export function renderComponentVNode(
   const instance = createComponentInstance(vnode, parentComponent, null)
   const res = setupComponent(instance, true /* isSSR */)
   const hasAsyncSetup = isPromise(res)
-  const prefetch = (vnode.type as ComponentOptions).serverPrefetch
-  if (hasAsyncSetup || prefetch) {
-    let p = hasAsyncSetup ? (res as Promise<void>) : Promise.resolve()
-    if (prefetch) {
-      p = p.then(() => prefetch.call(instance.proxy)).catch(err => {
-        warn(`[@vue/server-renderer]: Uncaught error in serverPrefetch:\n`, err)
-      })
+  const prefetches = instance.sp /* LifecycleHooks.SERVER_PREFETCH */
+  if (hasAsyncSetup || prefetches) {
+    let p: Promise<unknown> = hasAsyncSetup
+      ? (res as Promise<void>)
+      : Promise.resolve()
+    if (prefetches) {
+      p = p
+        .then(() =>
+          Promise.all(prefetches.map(prefetch => prefetch.call(instance.proxy)))
+        )
+        // Note: error display is already done by the wrapped lifecycle hook function.
+        .catch(() => {})
     }
     return p.then(() => renderComponentSubTree(instance, slotScopeId))
   } else {
@@ -108,12 +113,17 @@ function renderComponentSubTree(
   const comp = instance.type as Component
   const { getBuffer, push } = createBuffer()
   if (isFunction(comp)) {
-    renderVNode(
-      push,
-      (instance.subTree = renderComponentRoot(instance)),
-      instance,
-      slotScopeId
-    )
+    let root = renderComponentRoot(instance)
+    // #5817 scope ID attrs not falling through if functional component doesn't
+    // have props
+    if (!(comp as FunctionalComponent).props) {
+      for (const key in instance.attrs) {
+        if (key.startsWith(`data-v-`)) {
+          ;(root.props || (root.props = {}))[key] = ``
+        }
+      }
+    }
+    renderVNode(push, (instance.subTree = root), instance, slotScopeId)
   } else {
     if (
       (!instance.render || instance.render === NOOP) &&
@@ -124,12 +134,17 @@ function renderComponentSubTree(
       comp.ssrRender = ssrCompile(comp.template, instance)
     }
 
+    // perf: enable caching of computed getters during render
+    // since there cannot be state mutations during render.
+    for (const e of instance.scope.effects) {
+      if (e.computed) e.computed._cacheable = true
+    }
+
     const ssrRender = instance.ssrRender || comp.ssrRender
     if (ssrRender) {
       // optimized
       // resolve fallthrough attrs
-      let attrs =
-        instance.type.inheritAttrs !== false ? instance.attrs : undefined
+      let attrs = instance.inheritAttrs !== false ? instance.attrs : undefined
       let hasCloned = false
 
       let cur = instance
@@ -179,11 +194,8 @@ function renderComponentSubTree(
         slotScopeId
       )
     } else {
-      warn(
-        `Component ${
-          comp.name ? `${comp.name} ` : ``
-        } is missing template or render function.`
-      )
+      const componentName = comp.name || comp.__file || `<Anonymous>`
+      warn(`Component ${componentName} is missing template or render function.`)
       push(`<!---->`)
     }
   }
@@ -347,7 +359,9 @@ function renderTeleportVNode(
   const target = vnode.props && vnode.props.to
   const disabled = vnode.props && vnode.props.disabled
   if (!target) {
-    warn(`[@vue/server-renderer] Teleport is missing target prop.`)
+    if (!disabled) {
+      warn(`[@vue/server-renderer] Teleport is missing target prop.`)
+    }
     return []
   }
   if (!isString(target)) {

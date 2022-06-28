@@ -1,7 +1,12 @@
 import { Data } from '../component'
 import { Slots, RawSlots } from '../componentSlots'
-import { Comment, isVNode } from '../vnode'
 import {
+  ContextualRenderFn,
+  currentRenderingInstance
+} from '../componentRenderContext'
+import {
+  Comment,
+  isVNode,
   VNodeArrayChildren,
   openBlock,
   createBlock,
@@ -10,10 +15,8 @@ import {
 } from '../vnode'
 import { PatchFlags, SlotFlags } from '@vue/shared'
 import { warn } from '../warning'
-
-export let isRenderingCompiledSlot = 0
-export const setCompiledSlotRendering = (n: number) =>
-  (isRenderingCompiledSlot += n)
+import { createVNode } from '@vue/runtime-core'
+import { isAsyncWrapper } from '../apiAsyncComponent'
 
 /**
  * Compiler runtime helper for rendering `<slot/>`
@@ -28,6 +31,19 @@ export function renderSlot(
   fallback?: () => VNodeArrayChildren,
   noSlotted?: boolean
 ): VNode {
+  if (
+    currentRenderingInstance!.isCE ||
+    (currentRenderingInstance!.parent &&
+      isAsyncWrapper(currentRenderingInstance!.parent) &&
+      currentRenderingInstance!.parent.isCE)
+  ) {
+    return createVNode(
+      'slot',
+      name === 'default' ? null : { name },
+      fallback && fallback()
+    )
+  }
+
   let slot = slots[name]
 
   if (__DEV__ && slot && slot.length > 1) {
@@ -43,7 +59,9 @@ export function renderSlot(
   // invocation interfering with template-based block tracking, but in
   // `renderSlot` we can be sure that it's template-based so we can force
   // enable it.
-  isRenderingCompiledSlot++
+  if (slot && (slot as ContextualRenderFn)._c) {
+    ;(slot as ContextualRenderFn)._d = false
+  }
   openBlock()
   const validSlotContent = slot && ensureValidVNode(slot(props))
   const rendered = createBlock(
@@ -57,7 +75,9 @@ export function renderSlot(
   if (!noSlotted && rendered.scopeId) {
     rendered.slotScopeIds = [rendered.scopeId + '-s']
   }
-  isRenderingCompiledSlot--
+  if (slot && (slot as ContextualRenderFn)._c) {
+    ;(slot as ContextualRenderFn)._d = true
+  }
   return rendered
 }
 
